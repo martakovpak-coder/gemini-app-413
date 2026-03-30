@@ -1,0 +1,314 @@
+import React, { useState, useEffect } from 'react';
+import { UploadCloud, FileSpreadsheet, FileText, CheckCircle, AlertTriangle, ArrowRight, Download, Info } from 'lucide-react';
+
+export default function TempoReportApp() {
+  const [tempoFile, setTempoFile] = useState(null);
+  const [templateFile, setTemplateFile] = useState(null);
+  const [status, setStatus] = useState({ type: 'idle', message: '' });
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [excelJsLoaded, setExcelJsLoaded] = useState(false);
+
+  // Динамічне завантаження ExcelJS
+  useEffect(() => {
+    if (window.ExcelJS) {
+      setExcelJsLoaded(true);
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js';
+    script.onload = () => setExcelJsLoaded(true);
+    script.onerror = () => setStatus({ type: 'error', message: 'Не вдалося завантажити бібліотеку ExcelJS' });
+    document.body.appendChild(script);
+  }, []);
+
+  const parseCSV = (text, delimiter = ',') => {
+    const rows = [];
+    let row = [];
+    let cur = '';
+    let inQuotes = false;
+    
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (i + 1 < text.length && text[i + 1] === '"') { cur += '"'; i++; }
+          else { inQuotes = false; }
+        } else { cur += c; }
+      } else {
+        if (c === '"') { inQuotes = true; }
+        else if (c === delimiter) { row.push(cur.trim()); cur = ''; }
+        else if (c === '\n' || c === '\r') {
+          row.push(cur.trim()); rows.push(row); row = []; cur = '';
+          if (c === '\r' && i + 1 < text.length && text[i + 1] === '\n') i++;
+        } else { cur += c; }
+      }
+    }
+    if (cur || row.length > 0) { row.push(cur.trim()); rows.push(row); }
+    return rows.filter(r => r.length > 1 || r[0] !== '');
+  };
+
+  const processFiles = async () => {
+    if (!tempoFile || !templateFile) return;
+    setIsProcessing(true);
+    setStatus({ type: 'info', message: 'Аналіз даних...' });
+
+    try {
+      // 1. Читання CSV (Джерело Tempo)
+      let csvText = await tempoFile.text();
+      csvText = csvText.replace(/^\uFEFF/, ''); 
+      
+      const firstLine = csvText.split('\n')[0];
+      let delimiter = ',';
+      if (firstLine.split(';').length > firstLine.split(',').length) delimiter = ';';
+      else if (firstLine.split('\t').length > firstLine.split(',').length) delimiter = '\t';
+
+      const csvData = parseCSV(csvText, delimiter);
+      if (csvData.length < 2) throw new Error('CSV файл порожній або має невірний формат');
+
+      const headers = csvData[0].map(h => h.toLowerCase().trim());
+      
+      // СУВОРИЙ МАПІНГ КОЛОНОК
+      let epicIdx = headers.findIndex(h => h === 'epic' || h === 'epic name' || h === 'epic link');
+      if (epicIdx === -1) epicIdx = headers.findIndex(h => h.includes('epic'));
+
+      let issueIdx = headers.findIndex(h => h === 'issue summary' || h === 'task' || h === 'issue');
+      if (issueIdx === -1) issueIdx = headers.findIndex(h => (h.includes('task') || h.includes('issue')) && !h.includes('key') && !h.includes('id'));
+
+      let hoursIdx = headers.findIndex(h => h === 'billable' || h === 'hours spent' || h === 'billed hours');
+      if (hoursIdx === -1) hoursIdx = headers.findIndex(h => h.includes('billable') || h.includes('hour') || h.includes('time'));
+
+      const subtaskIdx = headers.findIndex(h => h.includes('sub-task') || h.includes('subtask'));
+
+      if (issueIdx === -1 || hoursIdx === -1) {
+        throw new Error(`Помилка: У CSV не знайдено колонок "Task/Issue" або "Billable". Знайдені: ${headers.join(', ')}`);
+      }
+
+      const isGroupedTempoExport = headers[0] === '' && subtaskIdx !== -1;
+      const taskMap = {};
+      let totalHoursCsv = 0;
+
+      for (let i = 1; i < csvData.length; i++) {
+        const row = csvData[i];
+        if (row.length <= Math.max(issueIdx, hoursIdx)) continue;
+        
+        const taskName = row[issueIdx] ? row[issueIdx].trim() : '';
+        const epic = epicIdx !== -1 && row[epicIdx] ? row[epicIdx].trim() : '';
+        const subTask = subtaskIdx !== -1 && row[subtaskIdx] ? row[subtaskIdx].trim() : '';
+        
+        if (!taskName) continue; 
+        
+        // Запобігання подвійному підрахунку годин з Tempo
+        if (isGroupedTempoExport && subTask !== '') continue; 
+
+        const hoursStr = row[hoursIdx] ? row[hoursIdx].replace(',', '.') : '0';
+        const hours = parseFloat(hoursStr) || 0;
+
+        if (!taskMap[taskName]) {
+          taskMap[taskName] = { epic, hours: 0, taskName };
+        }
+        taskMap[taskName].hours += hours;
+        totalHoursCsv += hours;
+      }
+
+      const sortedTasks = Object.values(taskMap).sort((a, b) => {
+        if (a.epic !== b.epic) return a.epic.localeCompare(b.epic);
+        return a.taskName.localeCompare(b.taskName);
+      });
+
+      if (sortedTasks.length === 0) throw new Error('Не знайдено валідних задач для експорту');
+
+      // 2. Робота з Excel Шаблоном
+      setStatus({ type: 'info', message: 'Форматування шаблону...' });
+      const templateBuffer = await templateFile.arrayBuffer();
+      
+      const workbook = new window.ExcelJS.Workbook();
+      await workbook.xlsx.load(templateBuffer);
+      
+      // Примусовий перерахунок формул при відкритті
+      workbook.calcProperties.fullCalcOnLoad = true;
+
+      const ws = workbook.worksheets[0];
+      const DATA_START_ROW = 4;
+
+      // Знімаємо Shared Formula (запобігає крашам ExcelJS)
+      ws.eachRow((row) => {
+        row.eachCell({ includeEmpty: true }, (cell) => {
+          if (cell.formula) {
+            cell.value = { formula: cell.formula };
+          }
+        });
+      });
+
+      // Безпечне дублювання рядка
+      if (sortedTasks.length > 1) {
+        ws.duplicateRow(DATA_START_ROW, sortedTasks.length - 1, true);
+      }
+
+      let totalWrittenHours = 0;
+      sortedTasks.forEach((task, idx) => {
+        const rowNum = DATA_START_ROW + idx;
+        const row = ws.getRow(rowNum);
+
+        // Динамічна адаптація формул для нових рядків
+        if (idx > 0) {
+          row.eachCell({ includeEmpty: true }, (cell) => {
+            if (cell.formula) {
+              const newFormula = cell.formula.replace(/\b([A-Z]{1,3})4\b/g, `$1${rowNum}`);
+              cell.value = { formula: newFormula };
+            }
+          });
+        }
+
+        // Жорсткий мапінг (Версія 00:20)
+        row.getCell(2).value = task.epic;         // Epic (Колонка B)
+        row.getCell(3).value = task.taskName;     // Task / User Story (Колонка C)
+        row.getCell(18).value = task.hours;       // Hours Spent (Колонка R)
+        
+        // Очищення сміття від копіювання шаблону (Від Acceptance Criteria до ролей)
+        for(let c = 4; c <= 14; c++) {
+            row.getCell(c).value = null;
+        }
+        
+        row.commit();
+        totalWrittenHours += task.hours;
+      });
+
+      // 3. Збереження файлу
+      setStatus({ type: 'info', message: 'Генерація XLSX...' });
+      const outputBuffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([outputBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = tempoFile.name.replace('.csv', '_Delivery.xlsx');
+      a.click();
+      URL.revokeObjectURL(url);
+
+      setStatus({ 
+        type: 'success', 
+        message: `✓ Успішно! Оброблено задач: ${sortedTasks.length}. Годин: ${totalWrittenHours.toFixed(2)}` 
+      });
+
+    } catch (err) {
+      console.error(err);
+      let msg = err.message || 'Сталася помилка при конвертації';
+      if (msg.includes('zip') || msg.includes('Corrupted')) {
+          msg = 'Помилка: Файл шаблону не є Excel (.xlsx). Будь ласка, переконайтесь, що завантажили шаблон, а не CSV.';
+      }
+      setStatus({ type: 'error', message: msg });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center py-12 px-4 sm:px-6 lg:px-8 font-sans text-gray-800">
+      <div className="max-w-xl w-full space-y-6 bg-white p-10 rounded-2xl shadow-xl border border-gray-100">
+        
+        <div className="text-center">
+          <div className="mx-auto flex items-center justify-center h-16 w-16 rounded-full bg-blue-100 mb-4">
+            <FileSpreadsheet className="h-8 w-8 text-blue-600" />
+          </div>
+          <h2 className="text-3xl font-extrabold text-gray-900 tracking-tight">Tempo → Delivery</h2>
+          <p className="mt-2 text-sm text-gray-500">Генерація Delivery репортів прямо у браузері</p>
+        </div>
+
+        {/* Інформаційний блок про стабільний мапінг */}
+        <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 flex items-start text-sm text-blue-800">
+          <Info className="h-5 w-5 text-blue-500 mr-3 flex-shrink-0 mt-0.5" />
+          <div>
+            <strong>Активні правила мапінгу:</strong>
+            <ul className="list-disc pl-4 mt-1 space-y-0.5 text-blue-700">
+              <li><b>Epic</b> → колонка B (Epic)</li>
+              <li><b>Task / Issue</b> → колонка C (Task / User Story)</li>
+              <li><b>Billable</b> години → колонка R (Hours Spent)</li>
+            </ul>
+          </div>
+        </div>
+
+        <div className="space-y-5">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">1. Файл вивантаження з Tempo (.csv)</label>
+            <div className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-xl transition-colors ${tempoFile ? 'border-green-400 bg-green-50' : 'border-gray-300 hover:border-blue-400 bg-gray-50'}`}>
+              <div className="space-y-1 text-center">
+                {tempoFile ? (
+                  <FileText className="mx-auto h-10 w-10 text-green-500" />
+                ) : (
+                  <UploadCloud className="mx-auto h-10 w-10 text-gray-400" />
+                )}
+                <div className="flex text-sm text-gray-600 justify-center">
+                  <label className="relative cursor-pointer bg-transparent rounded-md font-medium text-blue-600 hover:text-blue-500 focus-within:outline-none">
+                    <span>{tempoFile ? tempoFile.name : 'Обрати CSV файл'}</span>
+                    <input type="file" className="sr-only" accept=".csv" onChange={(e) => setTempoFile(e.target.files[0])} />
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">2. Шаблон репорту (.xlsx)</label>
+            <div className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-xl transition-colors ${templateFile ? 'border-green-400 bg-green-50' : 'border-gray-300 hover:border-blue-400 bg-gray-50'}`}>
+              <div className="space-y-1 text-center">
+                {templateFile ? (
+                  <FileSpreadsheet className="mx-auto h-10 w-10 text-green-500" />
+                ) : (
+                  <UploadCloud className="mx-auto h-10 w-10 text-gray-400" />
+                )}
+                <div className="flex text-sm text-gray-600 justify-center">
+                  <label className="relative cursor-pointer bg-transparent rounded-md font-medium text-blue-600 hover:text-blue-500 focus-within:outline-none">
+                    <span>{templateFile ? templateFile.name : 'Обрати шаблон (.xlsx)'}</span>
+                    <input type="file" className="sr-only" accept=".xlsx" onChange={(e) => setTemplateFile(e.target.files[0])} />
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {status.message && (
+            <div className={`rounded-lg p-4 flex items-center ${
+              status.type === 'error' ? 'bg-red-50 text-red-800' : 
+              status.type === 'success' ? 'bg-green-50 text-green-800' : 
+              'bg-blue-50 text-blue-800'
+            }`}>
+              {status.type === 'error' && <AlertTriangle className="h-5 w-5 mr-3 flex-shrink-0" />}
+              {status.type === 'success' && <CheckCircle className="h-5 w-5 mr-3 flex-shrink-0" />}
+              {status.type === 'info' && <ArrowRight className="h-5 w-5 mr-3 flex-shrink-0 animate-pulse" />}
+              <span className="text-sm font-medium">{status.message}</span>
+            </div>
+          )}
+
+          <button
+            onClick={processFiles}
+            disabled={isProcessing || !tempoFile || !templateFile}
+            className={`w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-bold text-white transition-all ${
+              isProcessing || !tempoFile || !templateFile
+                ? 'bg-gray-300 cursor-not-allowed'
+                : 'bg-[#0052CC] hover:bg-[#003E99] active:scale-[0.98]'
+            }`}
+          >
+            {isProcessing ? (
+              <span className="flex items-center">
+                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Обробка...
+              </span>
+            ) : (
+              <span className="flex items-center gap-2">
+                <Download className="h-5 w-5" />
+                Згенерувати Excel
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+      
+      <div className="mt-8 text-center text-xs text-gray-400">
+        Усі дані обробляються виключно у вашому браузері. Файли не завантажуються на сторонні сервери.
+      </div>
+    </div>
+  );
+}
